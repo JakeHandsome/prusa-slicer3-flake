@@ -1,0 +1,93 @@
+diff -ruN a/src/slic3r-shared/src/Slic3r/Biz/Preset/IO/BundleLoader.cpp b/src/slic3r-shared/src/Slic3r/Biz/Preset/IO/BundleLoader.cpp
+--- a/src/slic3r-shared/src/Slic3r/Biz/Preset/IO/BundleLoader.cpp
++++ b/src/slic3r-shared/src/Slic3r/Biz/Preset/IO/BundleLoader.cpp
+@@ -21,6 +21,35 @@
+ 
+ namespace fs = boost::filesystem;
+ 
++namespace {
++
++// Copy a bundle directory into `dst` with writable permissions.
++// boost::filesystem::copy preserves the source modes: from a read-only install
++// location (e.g. the Nix store, where directories are 0555 and files 0444) the
++// copied sub-directories would not be writable (so the copy itself fails part
++// way through) and the local preset files would remain read-only (so the app
++// could never update them).
++void copy_bundle_writable(const fs::path& src, const fs::path& dst)
++{
++    for (const auto& entry : fs::recursive_directory_iterator(src)) {
++        const fs::path target = dst / entry.path().lexically_relative(src);
++        if (entry.is_directory()) {
++            if (!fs::exists(target)) {
++                fs::create_directories(target);
++                fs::permissions(
++                    target,
++                    fs::owner_all | fs::group_read | fs::group_exe | fs::others_read | fs::others_exe
++                );
++            }
++        } else if (entry.is_regular_file()) {
++            fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing);
++            fs::permissions(target, fs::owner_read | fs::owner_write | fs::group_read | fs::others_read);
++        }
++    }
++}
++
++} // namespace
++
+ void populate_local_bundle(const BundlePaths& bundle_paths)
+ {
+     for (const auto& repo_entry : fs::directory_iterator(bundle_paths.app_bundle_path)) {
+@@ -42,20 +71,42 @@
+                     dest_path.filename().string()
+                 );
+                 if (fs::exists(dest_path)) {
+-                    // clean up the old directory
++                    // clean up the old directory. A previous interrupted copy
++                    // may have left read-only sub-directories (modes inherited
++                    // from a read-only source) whose contents cannot be removed
++                    // without the write bit, so make them writable first.
++                    for (const auto& entry : fs::recursive_directory_iterator(
++                             dest_path,
++                             fs::directory_options::skip_permission_denied
++                         ))
++                        if (entry.is_directory())
++                            fs::permissions(entry.path(), fs::owner_all);
+                     fs::remove_all(dest_path);
+                 }
+                 fs::create_directories(dest_path);
+-                fs::copy(
+-                    src_path,
+-                    dest_path,
+-                    fs::copy_options::recursive | fs::copy_options::overwrite_existing
+-                );
+-                fs::copy_file(
+-                    src_path.string() + ".idx",
+-                    dest_path.string() + ".idx",
+-                    fs::copy_options::overwrite_existing
+-                );
++                try {
++                    copy_bundle_writable(src_path, dest_path);
++                    const fs::path idx_path = src_path.string() + ".idx";
++                    if (fs::exists(idx_path)) {
++                        fs::copy_file(
++                            idx_path,
++                            dest_path.string() + ".idx",
++                            fs::copy_options::overwrite_existing
++                        );
++                    }
++                }
++                catch (const std::exception& e) {
++                    // A failed populate must not prevent startup: load_bundle()
++                    // falls back to the app bundle. Remove the partial copy so it
++                    // does not shadow the app bundle on the next start.
++                    SPDLOG_ERROR(
++                        "Populating local bundle {}/{} failed: {}",
++                        repo_entry.path().filename().string(),
++                        dest_path.filename().string(),
++                        e.what()
++                    );
++                    fs::remove_all(dest_path);
++                }
+             }
+         }
+     }
